@@ -8,12 +8,13 @@ Three pages (switch with 1 / 2 / 3 or Tab):
                "where is the problem?" verdict, live traffic, speed test, network
                interfaces and paired Bluetooth devices
   2 Devices    who is on your local network: IP, MAC address, name, vendor
-  3 Nearby     Bluetooth LE devices around you with signal strength
+  3 Nearby     Bluetooth LE devices around you (stronger than -80 dBm) with signal strength
 
 Install:   python3 -m pip install rich psutil bleak     (bleak is only needed for page 3)
 Run:       python3 netdash.py
-Keys:      1/2/3 or Tab = pages   s = speed test   r = refresh / rescan   q = quit
-           (arrows or j/k scroll the lists, a = all interfaces on the dashboard)
+Keys:      1/2/3 or Tab = pages   s = speed test   n = scan the network (page 2)
+           b = scan Bluetooth (page 3)   a = all interfaces (page 1)   q = quit
+           Arrows or j/k scroll the lists. Nothing is measured or scanned until you ask.
 """
 from __future__ import annotations
 
@@ -456,6 +457,8 @@ class BleState:
         self.lock = threading.Lock()
         self.installed = importlib.util.find_spec("bleak") is not None
         self.scanning = False
+        self.requested = False        # the user started a scan (key b) and has not stopped it
+        self.ever_scanned = False
         self.error: Optional[str] = None
 
 
@@ -724,13 +727,12 @@ class TrafficMonitor(threading.Thread):
 
 
 class Periodic(threading.Thread):
-    """Runs fn() every `period` seconds (or right away when kick.set() is called)."""
+    """Runs fn() every `period` seconds."""
 
     def __init__(self, name: str, fn, period: float, state: State, stop: threading.Event):
         super().__init__(daemon=True)
         self.label, self.fn, self.period = name, fn, period
         self.state, self.stop_ev = state, stop
-        self.kick = threading.Event()
 
     def run(self) -> None:
         while not self.stop_ev.is_set():
@@ -739,8 +741,7 @@ class Periodic(threading.Thread):
                 self.state.errors.pop(self.label, None)
             except Exception as exc:  # the dashboard must never crash because of a command
                 self.state.errors[self.label] = f"{type(exc).__name__}: {exc}"
-            self.kick.wait(self.period)
-            self.kick.clear()
+            self.stop_ev.wait(self.period)
 
 
 # --------------------------------------------------------------------------- #
@@ -1400,6 +1401,9 @@ COMPANY_IDS = {
 }
 
 
+BLE_MIN_RSSI = -80   # dBm: weaker devices are not listed (they are too far to be "nearby")
+
+
 def signal_level(rssi: float) -> int:
     """RSSI (dBm) -> 0..4 bars."""
     if rssi >= -55:
@@ -1435,17 +1439,41 @@ def describe_ble_error(exc: BaseException) -> str:
 
 
 class BleScanner(threading.Thread):
-    """Scans for BLE advertisements while `active` is set (only when its page is open)."""
+    """Scans for BLE advertisements, and only while the user has asked for it.
 
-    STALE_AFTER = 90.0  # forget devices that have not been heard for this long
+    The scan is started and stopped with start_scan() / stop_scan() (key b); the UI also
+    stops it when you leave the page. If it fails it stops: there are no silent retries.
+    """
+
+    STALE_AFTER = 90.0  # while scanning, forget devices that have not been heard for this long
 
     def __init__(self, state: State, stop: threading.Event):
         super().__init__(daemon=True)
         self.state, self.stop_ev = state, stop
         self.active = threading.Event()
-        self.reset_flag = threading.Event()
         self.bleak = None  # the bleak module (replaceable in tests)
 
+    # -- controls (called from the UI thread) ---------------------------------------- #
+    def start_scan(self) -> None:
+        ble = self.state.ble
+        with ble.lock:
+            ble.devices.clear()      # every scan starts from an empty list
+        if self.is_alive():          # keep the "bleak is missing" message of a dead thread
+            ble.error = None
+        ble.ever_scanned, ble.requested = True, True
+        self.active.set()
+
+    def stop_scan(self) -> None:
+        self.state.ble.requested = False
+        self.active.clear()
+
+    def toggle(self) -> None:
+        if self.active.is_set():
+            self.stop_scan()
+        else:
+            self.start_scan()
+
+    # -- scanner thread ------------------------------------------------------------------ #
     def run(self) -> None:
         ble = self.state.ble
         if self.bleak is None:
@@ -1482,21 +1510,17 @@ class BleScanner(threading.Thread):
         now = time.time()
         ble = self.state.ble
         with ble.lock:
-            if self.reset_flag.is_set():
-                ble.devices.clear()
-                self.reset_flag.clear()
             for addr in [a for a, d in ble.devices.items() if now - d.last_seen > self.STALE_AFTER]:
                 del ble.devices[addr]
 
     async def _main(self) -> None:
         ble = self.state.ble
         scanner = None
-        retry_at = 0.0
         try:
             while not self.stop_ev.is_set():
                 want = self.active.is_set()
                 try:
-                    if want and scanner is None and time.monotonic() >= retry_at:
+                    if want and scanner is None:
                         scanner = self.bleak.BleakScanner(detection_callback=self._on_adv)
                         await scanner.start()
                         ble.scanning, ble.error = True, None
@@ -1506,8 +1530,9 @@ class BleScanner(threading.Thread):
                 except Exception as exc:
                     scanner, ble.scanning = None, False
                     ble.error = describe_ble_error(exc)
-                    retry_at = time.monotonic() + 3.0
-                self._prune()
+                    self.stop_scan()   # no silent retries: press b to try again
+                if scanner is not None:  # a stopped scan keeps its results on screen
+                    self._prune()
                 await asyncio.sleep(0.2)
         finally:
             ble.scanning = False
@@ -1749,7 +1774,6 @@ class SpeedTest:
 PAGES = (("dash", "1", "Dashboard"), ("lan", "2", "Devices"), ("ble", "3", "Nearby"))
 KIND_ORDER = {"wifi": 0, "ethernet": 1, "other": 2, "virtual": 3, "loopback": 4}
 KIND_SYMBOL = {"wifi": "≋", "ethernet": "⇄", "other": "◈", "virtual": "◇", "loopback": "∞"}
-LAN_RESCAN_SECONDS = 60          # automatic rescan period while the Devices page is open
 LAT_FLOORS = {"router": 10.0, "internet": 50.0, "far": 100.0}   # minimum chart ceiling, ms
 
 
@@ -1855,9 +1879,9 @@ class UI:
 
     def footer(self):
         keys = {
-            "dash": (("s", "speed test"), ("r", "refresh"), ("a", "all interfaces"), ("Tab", "pages"), ("q", "quit")),
-            "lan": (("r", "rescan"), ("↑↓", "scroll"), ("s", "speed test"), ("Tab", "pages"), ("q", "quit")),
-            "ble": (("r", "clear list"), ("↑↓", "scroll"), ("Tab", "pages"), ("q", "quit")),
+            "dash": (("s", "speed test"), ("a", "all interfaces"), ("Tab", "pages"), ("q", "quit")),
+            "lan": (("n", "scan network"), ("↑↓", "scroll"), ("s", "speed test"), ("Tab", "pages"), ("q", "quit")),
+            "ble": (("b", "scan Bluetooth"), ("↑↓", "scroll"), ("Tab", "pages"), ("q", "quit")),
         }[self.page]
         t = Text(no_wrap=True)
         for key, label in keys:
@@ -2132,6 +2156,7 @@ class UI:
             if lan.error:
                 status.append("✖ ", style=f"bold {C_BAD}")
                 status.append(lan.error)
+                right.append("press n to retry")
             elif lan.scanning:
                 status.append(f"{self.spin()} ", style=C_ACCENT)
                 status.append(f"Scanning {lan.network or 'your network'}…", style="bold")
@@ -2139,9 +2164,11 @@ class UI:
             elif lan.last_scan:
                 status.append("✔ ", style=f"bold {C_GOOD}")
                 status.append(f"Scan complete at {time.strftime('%H:%M:%S', time.localtime(lan.last_scan))}", style="bold")
-                right.append(f"next scan in {max(0, LAN_RESCAN_SECONDS - (now - lan.last_scan)):.0f}s")
+                right.append("press n to rescan")
             else:
-                status.append("Waiting to scan…", style=C_DIM)
+                status.append("Press ", style=C_DIM)
+                status.append(" n ", style=f"bold black on {C_ACCENT}")
+                status.append(" to scan your network", style=C_DIM)
 
             devices = list(lan.devices)
             rows_avail = max(1, h - 3)          # status line + table header + note line
@@ -2180,7 +2207,11 @@ class UI:
             if len(devices) > rows_avail:
                 tail = Text(f"↑↓ {top + 1}–{min(len(devices), top + rows_avail)} of {len(devices)}", style=C_DIM)
                 note = two_col(note, tail, w, keep="right")
-            return Group(two_col(status, right, w, keep="left"), tbl, note)
+            parts: List = [two_col(status, right, w, keep="left")]
+            if devices:
+                parts.append(tbl)
+            parts.append(note)
+            return Group(*parts)
 
         s_lan = s.lan
         online = sum(1 for d in s_lan.devices if d.online)
@@ -2198,22 +2229,40 @@ class UI:
             with ble.lock:
                 devs = [{"addr": d.address, "name": d.name, "maker": d.manufacturer, "rssi": d.rssi,
                          "hist": list(d.history), "seen": d.last_seen} for d in ble.devices.values()]
+            nearby = [d for d in devs if d["rssi"] >= BLE_MIN_RSSI]   # weaker ones are too far away
+            hidden = len(devs) - len(nearby)
             status = Text(no_wrap=True, overflow="ellipsis")
+            right = Text(no_wrap=True, style=C_DIM)
+            if hidden:
+                right.append(f"{hidden} weaker than {BLE_MIN_RSSI} dBm hidden")
+            hint = ""
             if ble.error:
                 status.append("✖ ", style=f"bold {C_BAD}")
                 status.append(ble.error)
+                hint = "press b to retry"
             elif not ble.installed:
                 status.append("✖ ", style=f"bold {C_BAD}")
                 status.append("Bluetooth scanning needs the 'bleak' package:  python3 -m pip install bleak")
             elif ble.scanning:
                 status.append(f"{self.spin()} ", style=C_ACCENT)
-                status.append(f"Scanning for Bluetooth LE devices… {len(devs)} found", style="bold")
-            else:
+                status.append(f"Scanning… {len(nearby)} nearby", style="bold")
+                hint = "press b to stop"
+            elif ble.requested:
                 status.append("Starting the scanner…", style=C_DIM)
+            elif ble.ever_scanned:
+                status.append("■ Scan stopped", style="bold")
+                hint = "press b to scan again"
+            else:
+                status.append("Press ", style=C_DIM)
+                status.append(" b ", style=f"bold black on {C_ACCENT}")
+                status.append(" to scan for nearby Bluetooth devices", style=C_DIM)
+            if hint:
+                right.append(("  ·  " if hidden else "") + hint)
 
-            devs.sort(key=lambda d: (now - d["seen"] > 15, -d["rssi"]))
+            # While scanning, devices not heard for a while are dimmed; a stopped scan is a snapshot.
+            nearby.sort(key=lambda d: (ble.scanning and now - d["seen"] > 15, -d["rssi"]))
             rows_avail = max(1, h - 3)
-            top = self._clamp_scroll("ble", len(devs), rows_avail)
+            top = self._clamp_scroll("ble", len(nearby), rows_avail)
             tbl = Table(box=None, expand=True, pad_edge=False, show_edge=False,
                         header_style=C_DIM, padding=(0, 1), collapse_padding=True)
             tbl.add_column("Signal", no_wrap=True, min_width=13)
@@ -2226,9 +2275,9 @@ class UI:
             if w >= 110:
                 tbl.add_column("Address", no_wrap=True, min_width=17)
             tbl.add_column("Seen", no_wrap=True, justify="right", min_width=5)
-            for d in devs[top:top + rows_avail]:
+            for d in nearby[top:top + rows_avail]:
                 age = now - d["seen"]
-                stale = age > 15
+                stale = ble.scanning and age > 15
                 level = signal_level(d["rssi"])
                 lit = C_GOOD if level >= 3 else C_WARN if level == 2 else C_BAD
                 bars = Text(no_wrap=True)
@@ -2252,12 +2301,18 @@ class UI:
 
             note = Text(no_wrap=True, overflow="ellipsis", style=C_DIM)
             note.append("BLE advertisements only. Distance is a rough hint from signal strength; walls and bodies change it.")
-            if len(devs) > rows_avail:
-                tail = Text(f"↑↓ {top + 1}–{min(len(devs), top + rows_avail)} of {len(devs)}", style=C_DIM)
+            if len(nearby) > rows_avail:
+                tail = Text(f"↑↓ {top + 1}–{min(len(nearby), top + rows_avail)} of {len(nearby)}", style=C_DIM)
                 note = two_col(note, tail, w, keep="right")
-            return Group(status, tbl, note)
+            parts: List = [two_col(status, right, w, keep="left")]
+            if nearby:
+                parts.append(tbl)
+            elif ble.scanning:
+                parts.append(Text(f"No device stronger than {BLE_MIN_RSSI} dBm yet.", style=C_DIM))
+            parts.append(note)
+            return Group(*parts)
 
-        return self.panel(Dynamic(body), "Nearby Bluetooth devices", "signal strength (RSSI)")
+        return self.panel(Dynamic(body), "Nearby Bluetooth devices", f"stronger than {BLE_MIN_RSSI} dBm")
 
 
 # --------------------------------------------------------------------------- #
@@ -2281,7 +2336,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--streams", type=int, default=4, help="parallel connections (default: 4)")
     p.add_argument("--max-mb", type=int, default=250,
                    help="data cap per phase in MB, to spare metered connections (default: 250)")
-    p.add_argument("--no-speedtest", action="store_true", help="do not run the speed test at startup (press s to run it)")
     p.add_argument("--no-bluetooth", action="store_true", help="turn the Bluetooth panel off")
     p.add_argument("-a", "--all-interfaces", action="store_true",
                    help="also show virtual and loopback interfaces")
@@ -2352,19 +2406,14 @@ def main(argv=None) -> int:
     interval = max(0.2, args.interval)
     workers: List[threading.Thread] = [TargetMonitor(state, t, interval, stop) for t in state.targets]
     workers.append(TrafficMonitor(state, stop))
-    iface_worker = Periodic("interfaces", refresh_ifaces, 4.0, state, stop)
-    workers.append(iface_worker)
-    bt_worker = None
+    workers.append(Periodic("interfaces", refresh_ifaces, 4.0, state, stop))
     if not args.no_bluetooth:
-        bt_worker = Periodic("bluetooth", refresh_bt, 15.0, state, stop)
-        workers.append(bt_worker)
+        workers.append(Periodic("bluetooth", refresh_bt, 15.0, state, stop))
     else:
         state.bt = BtInfo(False, note="disabled (--no-bluetooth)")
     workers.append(ble_scanner)
     for w in workers:
         w.start()
-    if not args.no_speedtest:
-        speed.start()
 
     console = Console()
     ui = UI(state)
@@ -2377,15 +2426,8 @@ def main(argv=None) -> int:
             running = True
             while running:
                 t0 = time.monotonic()
-                # Pages only work while they are on screen: scans stop when you leave.
-                if ui.page == "ble":
-                    ble_scanner.active.set()
-                else:
-                    ble_scanner.active.clear()
-                lan = state.lan
-                if ui.page == "lan" and not lan.scanning and (
-                        lan.last_scan is None or time.time() - lan.last_scan > LAN_RESCAN_SECONDS):
-                    lan_scanner.start()
+                if ui.page != "ble" and ble_scanner.active.is_set():
+                    ble_scanner.stop_scan()   # leaving the Bluetooth page ends its scan
                 live.update(ui.render(console), refresh=True)
                 wait = max(0.0, frame - (time.monotonic() - t0))
                 if select.select([fd], [], [], wait)[0]:
@@ -2400,15 +2442,10 @@ def main(argv=None) -> int:
                             ui.next_page(-1)
                         elif key == "s":
                             speed.start()
-                        elif key == "r":
-                            if ui.page == "lan":
-                                lan_scanner.start()
-                            elif ui.page == "ble":
-                                ble_scanner.reset_flag.set()
-                            else:
-                                iface_worker.kick.set()
-                                if bt_worker:
-                                    bt_worker.kick.set()
+                        elif key == "n" and ui.page == "lan":
+                            lan_scanner.start()
+                        elif key == "b" and ui.page == "ble":
+                            ble_scanner.toggle()
                         elif key == "a" and ui.page == "dash":
                             state.show_all = not state.show_all
                         elif key in ("up", "k"):
