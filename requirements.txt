@@ -1,0 +1,3 @@
+rich>=13.0
+psutil>=5.9
+bleak>=0.21   # optional: only needed for the Nearby (Bluetooth scan) page
