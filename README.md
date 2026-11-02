@@ -2,7 +2,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
 
-<img src="https://github.com/RykerWilder/static_files/blob/main/netdash.webp" alt="Netdash">
+<img src="https://github.com/RykerWilder/static_files/blob/main/netdash.svg" alt="Netdash">
 
 Animated terminal dashboard for **macOS and Linux**, in a single Python file: it shows the quality of your
 connection, who is on your network and which Bluetooth devices are nearby.
