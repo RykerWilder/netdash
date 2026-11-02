@@ -18,7 +18,6 @@ Keys:      1/2/3 or Tab = pages   s = speed test   n = scan the network (page 2)
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import http.client
 import importlib.util
@@ -67,6 +66,19 @@ except ImportError as exc:  # pragma: no cover
 
 IS_MAC = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
+
+# --------------------------------------------------------------------------- #
+# Settings: netdash takes no command-line options, change the defaults here
+# --------------------------------------------------------------------------- #
+LATENCY_HOST = "1.1.1.1"       # Internet target of the latency panel
+LATENCY_PORT = 443
+LATENCY_INTERVAL = 1.0         # seconds between two latency samples
+SPEED_URL = "https://speed.cloudflare.com"   # speed test server (/__down and /__up endpoints)
+SPEED_DURATION = 8.0           # seconds for each of the download and upload phases
+SPEED_STREAMS = 4              # parallel connections
+SPEED_MAX_MB = 250             # data cap per phase, to spare metered connections
+BLE_MIN_RSSI = -80             # dBm: weaker Bluetooth devices are not listed (too far to be "nearby")
+FPS = 20                       # screen refreshes per second
 
 # --------------------------------------------------------------------------- #
 # Palette: colors chosen to stay distinguishable even without telling red from green.
@@ -463,15 +475,13 @@ class BleState:
 
 
 class State:
-    def __init__(self, host: str, port: int, show_all: bool = False,
-                 far_host: Optional[str] = None, far_port: int = 443,
-                 gateway: Optional[str] = None) -> None:
+    def __init__(self, host: str, port: int) -> None:
         self.targets: List[Target] = [
             Target("router", "Router", ports=(80, 443, 53), timeout=0.4, accept_refused=True),
             Target("internet", "Internet", host=host, ports=(port,)),
-            Target("far", "Far", host=far_host or "", ports=(far_port,)),
+            Target("far", "Far"),          # its host is picked automatically (see FAR_CANDIDATES)
         ]
-        self.gateway: Optional[str] = gateway
+        self.gateway: Optional[str] = None
         self.rx = Series()
         self.tx = Series()
         self.rates: Dict[str, Tuple[float, float]] = {}
@@ -481,7 +491,7 @@ class State:
         self.speed = SpeedState()
         self.lan = LanState()
         self.ble = BleState()
-        self.show_all = show_all
+        self.show_all = False
         self.errors: Dict[str, str] = {}
 
     def target(self, key: str) -> Target:
@@ -518,7 +528,7 @@ def tcp_probe(addr: str, port: int, timeout: float, accept_refused: bool = False
 
 
 # Public ping hosts, each in a different city/continent: the farthest one that answers
-# becomes the "far" target (override it with --far-host).
+# becomes the "far" target.
 FAR_CANDIDATES = (
     ("Sydney", "syd-au-ping.vultr.com"),
     ("Tokyo", "hnd-jp-ping.vultr.com"),
@@ -1399,9 +1409,6 @@ COMPANY_IDS = {
     0x009E: "Bose", 0x00E0: "Google", 0x012D: "Sony", 0x0171: "Amazon",
     0x01DA: "Logitech", 0x027D: "Huawei", 0x038F: "Xiaomi",
 }
-
-
-BLE_MIN_RSSI = -80   # dBm: weaker devices are not listed (they are too far to be "nearby")
 
 
 def signal_level(rssi: float) -> int:
@@ -2318,39 +2325,6 @@ class UI:
 # --------------------------------------------------------------------------- #
 # Startup
 # --------------------------------------------------------------------------- #
-def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog="netdash",
-        description="Animated terminal dashboard: latency, traffic, speed test, network interfaces, "
-                    "devices on your network and nearby Bluetooth.")
-    p.add_argument("--host", default="1.1.1.1", help="Internet host used to measure latency (default: 1.1.1.1)")
-    p.add_argument("--port", type=int, default=443, help="TCP port used to measure latency (default: 443)")
-    p.add_argument("--far-host", metavar="HOST[:PORT]",
-                   help="far host for the third latency probe (default: the farthest of a few public "
-                        "ping servers around the world)")
-    p.add_argument("--gateway", metavar="IP", help="router address, when it cannot be detected automatically")
-    p.add_argument("--interval", type=float, default=1.0, help="seconds between two latency samples (default: 1)")
-    p.add_argument("--speed-url", default="https://speed.cloudflare.com",
-                   help="speed test server exposing the /__down and /__up endpoints")
-    p.add_argument("--duration", type=float, default=8.0, help="duration of the download and upload phases in seconds (default: 8)")
-    p.add_argument("--streams", type=int, default=4, help="parallel connections (default: 4)")
-    p.add_argument("--max-mb", type=int, default=250,
-                   help="data cap per phase in MB, to spare metered connections (default: 250)")
-    p.add_argument("--no-bluetooth", action="store_true", help="turn the Bluetooth panel off")
-    p.add_argument("-a", "--all-interfaces", action="store_true",
-                   help="also show virtual and loopback interfaces")
-    p.add_argument("--fps", type=int, default=20, help="frames per second (default: 20)")
-    return p.parse_args(argv)
-
-
-def split_host_port(value: str, default_port: int) -> Tuple[str, int]:
-    if value.count(":") == 1:
-        host, _, port = value.partition(":")
-        if port.isdigit():
-            return host, int(port)
-    return value, default_port
-
-
 _ESC_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z~]|\x1bO[A-Za-z]")
 _KEY_SEQUENCES = {
     "\x1b[A": "up", "\x1b[B": "down", "\x1bOA": "up", "\x1bOB": "down",
@@ -2379,15 +2353,13 @@ def parse_keys(data: str) -> List[str]:
     return keys
 
 
-def main(argv=None) -> int:
-    args = parse_args(argv)
+def main() -> int:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         sys.exit("netdash needs an interactive terminal.")
 
-    far_host, far_port = split_host_port(args.far_host, 443) if args.far_host else (None, 443)
-    state = State(args.host, args.port, args.all_interfaces, far_host, far_port, args.gateway)
+    state = State(LATENCY_HOST, LATENCY_PORT)
     stop = threading.Event()
-    speed = SpeedTest(state.speed, args.speed_url, args.duration, args.streams, args.max_mb)
+    speed = SpeedTest(state.speed, SPEED_URL, SPEED_DURATION, SPEED_STREAMS, SPEED_MAX_MB)
     lan_scanner = LanScanner(state)
     ble_scanner = BleScanner(state, stop)
 
@@ -2398,19 +2370,15 @@ def main(argv=None) -> int:
         if main_if is None:
             main_if = next((i.name for i in ifaces if i.kind in ("wifi", "ethernet") and i.up and i.ipv4), None)
         state.ifaces, state.main_iface = ifaces, main_if
-        state.gateway = args.gateway or gateway
+        state.gateway = gateway
 
     def refresh_bt() -> None:
         state.bt = collect_bluetooth()
 
-    interval = max(0.2, args.interval)
-    workers: List[threading.Thread] = [TargetMonitor(state, t, interval, stop) for t in state.targets]
+    workers: List[threading.Thread] = [TargetMonitor(state, t, LATENCY_INTERVAL, stop) for t in state.targets]
     workers.append(TrafficMonitor(state, stop))
     workers.append(Periodic("interfaces", refresh_ifaces, 4.0, state, stop))
-    if not args.no_bluetooth:
-        workers.append(Periodic("bluetooth", refresh_bt, 15.0, state, stop))
-    else:
-        state.bt = BtInfo(False, note="disabled (--no-bluetooth)")
+    workers.append(Periodic("bluetooth", refresh_bt, 15.0, state, stop))
     workers.append(ble_scanner)
     for w in workers:
         w.start()
@@ -2419,7 +2387,7 @@ def main(argv=None) -> int:
     ui = UI(state)
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
-    frame = 1.0 / max(1, args.fps)
+    frame = 1.0 / FPS
     try:
         tty.setcbreak(fd)
         with Live(ui.render(console), console=console, screen=True, auto_refresh=False) as live:
