@@ -1,18 +1,18 @@
 # netdash
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+
+<img src="https://github.com/RykerWilder/static_files/blob/main/netdash.webp" alt="Netdash">
 
 Animated terminal dashboard for **macOS and Linux**, in a single Python file: it shows the quality of your
 connection, who is on your network and which Bluetooth devices are nearby.
 
 ## Installation
 
-Requires Python 3.8 or newer.
-
 ```bash
 python3 -m pip install -r requirements.txt
 python3 netdash.py
 ```
-
-`requirements.txt` installs `rich` and `psutil`, plus `bleak`, which is only needed for the Nearby tab.
 
 ## Tabs
 
