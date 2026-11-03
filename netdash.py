@@ -3,26 +3,22 @@
 """
 netdash - animated terminal dashboard for macOS and Linux.
 
-Three pages (switch with 1 / 2 / 3 or Tab):
+Two pages (switch with 1 / 2 or Tab):
   1 Dashboard  latency to your router, the Internet and a far host with an automatic
-               "where is the problem?" verdict, live traffic, speed test, network
-               interfaces and paired Bluetooth devices
+               "where is the problem?" verdict, live traffic, speed test and
+               network interfaces
   2 Devices    who is on your local network: IP, MAC address, name, vendor
-  3 Nearby     Bluetooth LE devices around you (stronger than -80 dBm) with signal strength
 
-Install:   python3 -m pip install rich psutil bleak     (bleak is only needed for page 3)
+Install:   python3 -m pip install rich psutil
 Run:       python3 netdash.py
-Keys:      1/2/3 or Tab = pages   s = speed test   n = scan the network (page 2)
-           b = scan Bluetooth (page 3)   a = all interfaces (page 1)   q = quit
+Keys:      1/2 or Tab = pages   s = speed test   n = scan the network (page 2)
+           a = all interfaces (page 1)   q = quit
            Arrows or j/k scroll the lists. Nothing is measured or scanned until you ask.
 """
 from __future__ import annotations
 
-import asyncio
 import http.client
-import importlib.util
 import ipaddress
-import json
 import math
 import os
 import re
@@ -77,7 +73,6 @@ SPEED_URL = "https://speed.cloudflare.com"   # speed test server (/__down and /_
 SPEED_DURATION = 8.0           # seconds for each of the download and upload phases
 SPEED_STREAMS = 4              # parallel connections
 SPEED_MAX_MB = 250             # data cap per phase, to spare metered connections
-BLE_MIN_RSSI = -80             # dBm: weaker Bluetooth devices are not listed (too far to be "nearby")
 FPS = 20                       # screen refreshes per second
 
 # --------------------------------------------------------------------------- #
@@ -367,25 +362,6 @@ class Iface:
     is_default: bool = False
 
 
-@dataclass
-class BtDevice:
-    name: str
-    address: str = ""
-    connected: bool = False
-    kind: str = ""
-    battery: Optional[int] = None
-
-
-@dataclass
-class BtInfo:
-    available: bool
-    powered: bool = False
-    name: str = ""
-    address: str = ""
-    note: str = ""
-    devices: List[BtDevice] = field(default_factory=list)
-
-
 class SpeedState:
     def __init__(self) -> None:
         self.reset()
@@ -451,29 +427,6 @@ class LanState:
         self.oui_loaded = False
 
 
-@dataclass
-class BleDevice:
-    address: str
-    name: str = ""
-    manufacturer: str = ""
-    rssi: float = -100.0          # smoothed signal strength in dBm
-    history: List[int] = field(default_factory=list)
-    first_seen: float = 0.0
-    last_seen: float = 0.0
-    adv_count: int = 0
-
-
-class BleState:
-    def __init__(self) -> None:
-        self.devices: Dict[str, BleDevice] = {}
-        self.lock = threading.Lock()
-        self.installed = importlib.util.find_spec("bleak") is not None
-        self.scanning = False
-        self.requested = False        # the user started a scan (key b) and has not stopped it
-        self.ever_scanned = False
-        self.error: Optional[str] = None
-
-
 class State:
     def __init__(self, host: str, port: int) -> None:
         self.targets: List[Target] = [
@@ -487,10 +440,8 @@ class State:
         self.rates: Dict[str, Tuple[float, float]] = {}
         self.ifaces: List[Iface] = []
         self.main_iface: Optional[str] = None
-        self.bt: Optional[BtInfo] = None
         self.speed = SpeedState()
         self.lan = LanState()
-        self.ble = BleState()
         self.show_all = False
         self.errors: Dict[str, str] = {}
 
@@ -909,110 +860,6 @@ def collect_interfaces(default: Optional[str] = None) -> List[Iface]:
 
 
 # --------------------------------------------------------------------------- #
-# Bluetooth (macOS: system_profiler, Linux: bluetoothctl)
-# --------------------------------------------------------------------------- #
-_BT_KINDS = {
-    "audio-headset": "Headset", "audio-headphones": "Headphones", "audio-card": "Audio",
-    "input-keyboard": "Keyboard", "input-mouse": "Mouse", "input-gaming": "Gamepad",
-    "input-tablet": "Tablet", "phone": "Phone", "computer": "Computer",
-    "printer": "Printer", "camera-video": "Camera", "video-display": "Display",
-}
-
-
-def _pct(value) -> Optional[int]:
-    m = re.search(r"(\d+)", str(value)) if value is not None else None
-    return int(m.group(1)) if m else None
-
-
-def parse_macos_bluetooth(data: dict) -> BtInfo:
-    props = data.get("controller_properties") or {}
-    powered = props.get("controller_state") == "attrib_on"
-    if not props and isinstance(data.get("local_device_title"), dict):  # macOS <= 11
-        powered = data["local_device_title"].get("general_power") == "attrib_on"
-        props = data["local_device_title"]
-    info = BtInfo(True, powered=powered,
-                  name=props.get("controller_chipset") or props.get("general_name") or "Controller",
-                  address=props.get("controller_address") or props.get("general_address") or "")
-
-    def add(dname: str, d: dict, connected: bool) -> None:
-        bats = [_pct(d.get(k)) for k in
-                ("device_batteryLevelMain", "device_batteryLevelLeft", "device_batteryLevelRight")]
-        bats = [b for b in bats if b is not None]
-        info.devices.append(BtDevice(
-            name=dname, address=d.get("device_address", ""), connected=connected,
-            kind=d.get("device_minorType") or d.get("device_majorType") or "",
-            battery=min(bats) if bats else None))
-
-    for key, conn in (("device_connected", True), ("device_not_connected", False)):
-        for entry in data.get(key) or []:
-            for dname, d in entry.items():
-                add(dname, d if isinstance(d, dict) else {}, conn)
-    for entry in data.get("device_title") or []:  # macOS <= 11
-        for dname, d in entry.items():
-            d = d if isinstance(d, dict) else {}
-            add(dname, d, str(d.get("device_isconnected", "")).lower().endswith("yes"))
-    return info
-
-
-def bluetooth_macos() -> BtInfo:
-    out = run(["system_profiler", "SPBluetoothDataType", "-json"], timeout=15)
-    try:
-        data = json.loads(out)["SPBluetoothDataType"][0]
-    except (ValueError, KeyError, IndexError, TypeError):
-        return BtInfo(False, note="Bluetooth not available")
-    return parse_macos_bluetooth(data)
-
-
-def parse_bluetoothctl_show(text: str) -> Optional[BtInfo]:
-    if not text.strip() or "No default controller" in text:
-        return None
-    first = re.match(r"\s*Controller\s+([0-9A-Fa-f:]{17})", text)
-    kv: Dict[str, str] = {}
-    for line in text.splitlines()[1:]:
-        if ":" in line:
-            k, v = line.split(":", 1)
-            kv.setdefault(k.strip(), v.strip())
-    return BtInfo(True, powered=kv.get("Powered", "").lower() == "yes",
-                  name=kv.get("Alias") or kv.get("Name") or "Controller",
-                  address=first.group(1) if first else "")
-
-
-def parse_bluetoothctl_info(text: str, address: str, fallback_name: str) -> BtDevice:
-    kv: Dict[str, str] = {}
-    for line in text.splitlines()[1:]:
-        if ":" in line:
-            k, v = line.split(":", 1)
-            kv.setdefault(k.strip(), v.strip())
-    batt = re.search(r"\((\d+)\)", kv.get("Battery Percentage", ""))
-    icon = kv.get("Icon", "")
-    return BtDevice(name=kv.get("Alias") or kv.get("Name") or fallback_name, address=address,
-                    connected=kv.get("Connected", "").lower() == "yes",
-                    kind=_BT_KINDS.get(icon, icon), battery=int(batt.group(1)) if batt else None)
-
-
-def bluetooth_linux() -> BtInfo:
-    if not shutil.which("bluetoothctl"):
-        return BtInfo(False, note="bluetoothctl not found (install bluez)")
-    info = parse_bluetoothctl_show(run(["bluetoothctl", "show"], 4))
-    if info is None:
-        return BtInfo(False, note="no Bluetooth adapter available")
-    for line in run(["bluetoothctl", "devices"], 4).splitlines()[:25]:
-        m = re.match(r"\s*Device\s+([0-9A-Fa-f:]{17})\s*(.*)", line)
-        if m:
-            addr, name = m.group(1), m.group(2).strip() or m.group(1)
-            info.devices.append(parse_bluetoothctl_info(run(["bluetoothctl", "info", addr], 3), addr, name))
-    return info
-
-
-def collect_bluetooth() -> BtInfo:
-    if IS_MAC:
-        return bluetooth_macos()
-    if IS_LINUX:
-        return bluetooth_linux()
-    return BtInfo(False, note="unsupported platform")
-
-
-# --------------------------------------------------------------------------- #
 # Devices on the local network (ARP sweep + mDNS / reverse-DNS names)
 # --------------------------------------------------------------------------- #
 class LanScanError(Exception):
@@ -1401,156 +1248,6 @@ class LanScanner:
 
 
 # --------------------------------------------------------------------------- #
-# Nearby Bluetooth Low Energy devices (via the optional `bleak` package)
-# --------------------------------------------------------------------------- #
-# Bluetooth SIG company identifiers (only the ones that are certain).
-COMPANY_IDS = {
-    0x0006: "Microsoft", 0x004C: "Apple", 0x0075: "Samsung", 0x0087: "Garmin",
-    0x009E: "Bose", 0x00E0: "Google", 0x012D: "Sony", 0x0171: "Amazon",
-    0x01DA: "Logitech", 0x027D: "Huawei", 0x038F: "Xiaomi",
-}
-
-
-def signal_level(rssi: float) -> int:
-    """RSSI (dBm) -> 0..4 bars."""
-    if rssi >= -55:
-        return 4
-    if rssi >= -67:
-        return 3
-    if rssi >= -78:
-        return 2
-    if rssi >= -90:
-        return 1
-    return 0
-
-
-def proximity_label(rssi: float) -> str:
-    """Coarse hint only: RSSI depends on the transmit power, walls, bodies, antennas..."""
-    return ("very far", "far", "nearby", "close", "very close")[signal_level(rssi)]
-
-
-def looks_like_address(name: str) -> bool:
-    return bool(re.fullmatch(r"([0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}", name))
-
-
-def describe_ble_error(exc: BaseException) -> str:
-    msg = str(exc) or type(exc).__name__
-    low = msg.lower()
-    if "not authorized" in low or "permission" in low or "denied" in low:
-        return msg + " (macOS: allow your terminal under System Settings > Privacy & Security > Bluetooth)"
-    if "adapter" in low and ("no " in low or "not found" in low):
-        return "No Bluetooth adapter found"
-    if "turned off" in low or "powered off" in low or "not powered" in low:
-        return "Bluetooth is turned off"
-    return msg
-
-
-class BleScanner(threading.Thread):
-    """Scans for BLE advertisements, and only while the user has asked for it.
-
-    The scan is started and stopped with start_scan() / stop_scan() (key b); the UI also
-    stops it when you leave the page. If it fails it stops: there are no silent retries.
-    """
-
-    STALE_AFTER = 90.0  # while scanning, forget devices that have not been heard for this long
-
-    def __init__(self, state: State, stop: threading.Event):
-        super().__init__(daemon=True)
-        self.state, self.stop_ev = state, stop
-        self.active = threading.Event()
-        self.bleak = None  # the bleak module (replaceable in tests)
-
-    # -- controls (called from the UI thread) ---------------------------------------- #
-    def start_scan(self) -> None:
-        ble = self.state.ble
-        with ble.lock:
-            ble.devices.clear()      # every scan starts from an empty list
-        if self.is_alive():          # keep the "bleak is missing" message of a dead thread
-            ble.error = None
-        ble.ever_scanned, ble.requested = True, True
-        self.active.set()
-
-    def stop_scan(self) -> None:
-        self.state.ble.requested = False
-        self.active.clear()
-
-    def toggle(self) -> None:
-        if self.active.is_set():
-            self.stop_scan()
-        else:
-            self.start_scan()
-
-    # -- scanner thread ------------------------------------------------------------------ #
-    def run(self) -> None:
-        ble = self.state.ble
-        if self.bleak is None:
-            try:
-                import bleak  # type: ignore
-            except ImportError:
-                ble.installed = False
-                ble.error = "Bluetooth scanning needs the 'bleak' package:  python3 -m pip install bleak"
-                return
-            self.bleak = bleak
-        asyncio.run(self._main())
-
-    def _on_adv(self, device, adv) -> None:
-        now = time.time()
-        ble = self.state.ble
-        with ble.lock:
-            d = ble.devices.get(device.address)
-            if d is None:
-                d = ble.devices[device.address] = BleDevice(address=device.address, first_seen=now)
-            name = (getattr(adv, "local_name", None) or getattr(device, "name", None) or "").strip()
-            if name and not looks_like_address(name):
-                d.name = name
-            if adv.manufacturer_data and not d.manufacturer:
-                cid = next(iter(adv.manufacturer_data))
-                d.manufacturer = COMPANY_IDS.get(cid, f"0x{cid:04X}")
-            rssi = float(adv.rssi)
-            d.rssi = rssi if d.adv_count == 0 else d.rssi * 0.6 + rssi * 0.4   # smooth the jitter
-            d.history.append(int(rssi))
-            del d.history[:-40]
-            d.last_seen = now
-            d.adv_count += 1
-
-    def _prune(self) -> None:
-        now = time.time()
-        ble = self.state.ble
-        with ble.lock:
-            for addr in [a for a, d in ble.devices.items() if now - d.last_seen > self.STALE_AFTER]:
-                del ble.devices[addr]
-
-    async def _main(self) -> None:
-        ble = self.state.ble
-        scanner = None
-        try:
-            while not self.stop_ev.is_set():
-                want = self.active.is_set()
-                try:
-                    if want and scanner is None:
-                        scanner = self.bleak.BleakScanner(detection_callback=self._on_adv)
-                        await scanner.start()
-                        ble.scanning, ble.error = True, None
-                    elif not want and scanner is not None:
-                        await scanner.stop()
-                        scanner, ble.scanning = None, False
-                except Exception as exc:
-                    scanner, ble.scanning = None, False
-                    ble.error = describe_ble_error(exc)
-                    self.stop_scan()   # no silent retries: press b to try again
-                if scanner is not None:  # a stopped scan keeps its results on screen
-                    self._prune()
-                await asyncio.sleep(0.2)
-        finally:
-            ble.scanning = False
-            if scanner is not None:
-                try:
-                    await scanner.stop()
-                except Exception:
-                    pass
-
-
-# --------------------------------------------------------------------------- #
 # Speed test (HTTP against Cloudflare's public endpoints, standard library only)
 # --------------------------------------------------------------------------- #
 class SpeedTestError(Exception):
@@ -1778,7 +1475,7 @@ class SpeedTest:
 # --------------------------------------------------------------------------- #
 # User interface
 # --------------------------------------------------------------------------- #
-PAGES = (("dash", "1", "Dashboard"), ("lan", "2", "Devices"), ("ble", "3", "Nearby"))
+PAGES = (("dash", "1", "Dashboard"), ("lan", "2", "Devices"))
 KIND_ORDER = {"wifi": 0, "ethernet": 1, "other": 2, "virtual": 3, "loopback": 4}
 KIND_SYMBOL = {"wifi": "≋", "ethernet": "⇄", "other": "◈", "virtual": "◇", "loopback": "∞"}
 LAT_FLOORS = {"router": 10.0, "internet": 50.0, "far": 100.0}   # minimum chart ceiling, ms
@@ -1788,7 +1485,7 @@ class UI:
     def __init__(self, state: State):
         self.s = state
         self.page = "dash"
-        self.scroll = {"lan": 0, "ble": 0}
+        self.scroll = {"lan": 0}
         self.t = time.time()
         self._last = time.monotonic()
         self.scale = Ease(50.0)
@@ -1848,13 +1545,10 @@ class UI:
         body = root["body"]
         if self.page == "lan":
             body.update(self.lan_panel())
-        elif self.page == "ble":
-            body.update(self.ble_panel())
         else:
             body.split_column(Layout(name="top", ratio=6), Layout(self.speed_panel(), size=7),
-                              Layout(name="bottom", ratio=4))
+                              Layout(self.iface_panel(), ratio=4))
             body["top"].split_row(Layout(self.latency_panel()), Layout(self.traffic_panel()))
-            body["bottom"].split_row(Layout(self.iface_panel(), ratio=3), Layout(self.bt_panel(), ratio=2))
         return root
 
     def panel(self, body, title: str, extra: str = "") -> Panel:
@@ -1888,7 +1582,6 @@ class UI:
         keys = {
             "dash": (("s", "speed test"), ("a", "all interfaces"), ("Tab", "pages"), ("q", "quit")),
             "lan": (("n", "scan network"), ("↑↓", "scroll"), ("s", "speed test"), ("Tab", "pages"), ("q", "quit")),
-            "ble": (("b", "scan Bluetooth"), ("↑↓", "scroll"), ("Tab", "pages"), ("q", "quit")),
         }[self.page]
         t = Text(no_wrap=True)
         for key, label in keys:
@@ -2046,15 +1739,12 @@ class UI:
             vis = list(s.ifaces) if s.show_all else [i for i in s.ifaces if i.kind in ("wifi", "ethernet", "other")]
             hidden = len(s.ifaces) - len(vis)
             vis.sort(key=lambda i: (not i.is_default, KIND_ORDER.get(i.kind, 9), not i.up, i.name))
-            compact = w < 52  # narrow terminals (80 columns): no details, download only
             tbl = Table(box=None, expand=True, pad_edge=False, show_edge=False,
                         header_style=C_DIM, padding=(0, 1), collapse_padding=True)
             tbl.add_column("Interface", no_wrap=True, overflow="ellipsis", min_width=12)
             tbl.add_column("IPv4", no_wrap=True, min_width=15)
-            if not compact:
-                tbl.add_column("Details", no_wrap=True, overflow="ellipsis", ratio=1)
-            tbl.add_column("↓" if compact else "↓ / ↑", no_wrap=True, justify="right",
-                           min_width=6 if compact else 13)
+            tbl.add_column("Details", no_wrap=True, overflow="ellipsis", ratio=1)
+            tbl.add_column("↓ / ↑", no_wrap=True, justify="right", min_width=13)
 
             notes = []
             avail = max(1, h - 1)  # one row is the header
@@ -2084,72 +1774,16 @@ class UI:
                                      (i.name, "bold" if i.up else C_DIM))
                 if i.is_default:
                     name.append(" ★", style=C_WARN)
-                cells = [name, Text(i.ipv4 or "—", style="" if i.ipv4 else C_DIM)]
-                if not compact:
-                    cells.append(Text(" · ".join(parts), style=C_DIM))
-                rates = Text.assemble((f"↓{fmt_axis_rate(rx)}", C_DOWN if rx else C_DIM))
-                if not compact:
-                    rates.append(" ")
-                    rates.append(f"↑{fmt_axis_rate(tx)}", style=C_UP if tx else C_DIM)
-                cells.append(rates)
-                tbl.add_row(*cells)
+                rates = Text.assemble((f"↓{fmt_axis_rate(rx)}", C_DOWN if rx else C_DIM), " ",
+                                      (f"↑{fmt_axis_rate(tx)}", C_UP if tx else C_DIM))
+                tbl.add_row(name, Text(i.ipv4 or "—", style="" if i.ipv4 else C_DIM),
+                            Text(" · ".join(parts), style=C_DIM), rates)
             out: List = [tbl]
             if notes:
                 out.append(Text("  ".join(notes), style=C_DIM))
             return Group(*out)
 
         return self.panel(Dynamic(body), "Network interfaces", "★ default route · bit/s")
-
-    # -- bluetooth (paired / connected devices) ----------------------------------- #
-    def bt_panel(self):
-        s = self.s
-
-        def body(w: int, h: int):
-            bt = s.bt
-            if bt is None:
-                return Text(f"{self.spin()} looking for adapters…", style=C_DIM)
-            head = Text(no_wrap=True, overflow="ellipsis")
-            if not bt.available:
-                head.append("✖ ", style=C_BAD)
-                head.append(bt.note or "unavailable", style=C_DIM)
-                return head
-            if bt.powered:
-                head.append("● on", style=C_GOOD)
-            else:
-                head.append("○ off", style=C_WARN)
-            head.append(f"  {bt.name} {bt.address}".rstrip(), style=C_DIM)
-            if not bt.devices:
-                return Group(head, Text("no known devices", style=C_DIM))
-            devs = sorted(bt.devices, key=lambda d: (not d.connected, d.name.lower()))
-            tbl = Table(box=None, expand=True, pad_edge=False, show_edge=False,
-                        header_style=C_DIM, padding=(0, 1))
-            tbl.add_column("Device", no_wrap=True, overflow="ellipsis", ratio=4)
-            tbl.add_column("Type", no_wrap=True, overflow="ellipsis", ratio=2)
-            tbl.add_column("Batt.", no_wrap=True, justify="right", min_width=5)
-            avail = max(1, h - 2)
-            extra = max(0, len(devs) - avail)
-            if extra:
-                devs = devs[:max(1, avail - 1)]
-                extra = len(bt.devices) - len(devs)
-            pulse = int(self.t * 2) % 2 == 0
-            for d in devs:
-                if d.connected:
-                    dot = Text("●", style=f"bold {C_GOOD}" if pulse else C_GOOD)
-                else:
-                    dot = Text("○", style=C_DIM)
-                bat = Text("—", style=C_DIM)
-                if d.battery is not None:
-                    col = C_GOOD if d.battery > 40 else C_WARN if d.battery > 15 else C_BAD
-                    bat = Text(f"{d.battery}%", style=col)
-                tbl.add_row(Text.assemble(dot, " ", (d.name, "" if d.connected else C_DIM)),
-                            Text(d.kind or "—", style=C_DIM), bat)
-            out: List = [head, tbl]
-            if extra:
-                out.append(Text(f"+{extra} more", style=C_DIM))
-            return Group(*out)
-
-        n = len([d for d in (s.bt.devices if s.bt else []) if d.connected])
-        return self.panel(Dynamic(body), "Bluetooth", f"{n} connected" if s.bt and s.bt.available else "")
 
     # -- page 2: devices on the local network ------------------------------------------ #
     def lan_panel(self):
@@ -2226,101 +1860,6 @@ class UI:
             f" · {len(s_lan.devices) - online} offline" if len(s_lan.devices) > online else "") if s_lan.network else ""
         return self.panel(Dynamic(body), "Devices on your network", extra)
 
-    # -- page 3: nearby Bluetooth LE devices ---------------------------------------------- #
-    def ble_panel(self):
-        s = self.s
-
-        def body(w: int, h: int):
-            ble = s.ble
-            now = time.time()
-            with ble.lock:
-                devs = [{"addr": d.address, "name": d.name, "maker": d.manufacturer, "rssi": d.rssi,
-                         "hist": list(d.history), "seen": d.last_seen} for d in ble.devices.values()]
-            nearby = [d for d in devs if d["rssi"] >= BLE_MIN_RSSI]   # weaker ones are too far away
-            hidden = len(devs) - len(nearby)
-            status = Text(no_wrap=True, overflow="ellipsis")
-            right = Text(no_wrap=True, style=C_DIM)
-            if hidden:
-                right.append(f"{hidden} weaker than {BLE_MIN_RSSI} dBm hidden")
-            hint = ""
-            if ble.error:
-                status.append("✖ ", style=f"bold {C_BAD}")
-                status.append(ble.error)
-                hint = "press b to retry"
-            elif not ble.installed:
-                status.append("✖ ", style=f"bold {C_BAD}")
-                status.append("Bluetooth scanning needs the 'bleak' package:  python3 -m pip install bleak")
-            elif ble.scanning:
-                status.append(f"{self.spin()} ", style=C_ACCENT)
-                status.append(f"Scanning… {len(nearby)} nearby", style="bold")
-                hint = "press b to stop"
-            elif ble.requested:
-                status.append("Starting the scanner…", style=C_DIM)
-            elif ble.ever_scanned:
-                status.append("■ Scan stopped", style="bold")
-                hint = "press b to scan again"
-            else:
-                status.append("Press ", style=C_DIM)
-                status.append(" b ", style=f"bold black on {C_ACCENT}")
-                status.append(" to scan for nearby Bluetooth devices", style=C_DIM)
-            if hint:
-                right.append(("  ·  " if hidden else "") + hint)
-
-            # While scanning, devices not heard for a while are dimmed; a stopped scan is a snapshot.
-            nearby.sort(key=lambda d: (ble.scanning and now - d["seen"] > 15, -d["rssi"]))
-            rows_avail = max(1, h - 3)
-            top = self._clamp_scroll("ble", len(nearby), rows_avail)
-            tbl = Table(box=None, expand=True, pad_edge=False, show_edge=False,
-                        header_style=C_DIM, padding=(0, 1), collapse_padding=True)
-            tbl.add_column("Signal", no_wrap=True, min_width=13)
-            tbl.add_column("Name", no_wrap=True, overflow="ellipsis", ratio=3)
-            tbl.add_column("Maker", no_wrap=True, overflow="ellipsis", ratio=2, min_width=8)
-            if w >= 78:
-                tbl.add_column("Distance", no_wrap=True, min_width=10)
-            if w >= 96:
-                tbl.add_column("Trend", no_wrap=True, min_width=12)
-            if w >= 110:
-                tbl.add_column("Address", no_wrap=True, min_width=17)
-            tbl.add_column("Seen", no_wrap=True, justify="right", min_width=5)
-            for d in nearby[top:top + rows_avail]:
-                age = now - d["seen"]
-                stale = ble.scanning and age > 15
-                level = signal_level(d["rssi"])
-                lit = C_GOOD if level >= 3 else C_WARN if level == 2 else C_BAD
-                bars = Text(no_wrap=True)
-                for n, ch in enumerate("▂▄▆█"):  # unlit bars shrink to a thin line: shape, not just color
-                    on = n < level and not stale
-                    bars.append(ch if on else "▁", style=lit if on else C_TRACK)
-                bars.append(f" {d['rssi']:4.0f} dBm", style=C_DIM if stale else "")
-                dim = C_DIM if stale else ""
-                cells = [bars,
-                         Text(d["name"] or "(unknown)", style=C_DIM if stale or not d["name"] else ""),
-                         Text(d["maker"] or "—", style=C_DIM)]
-                if w >= 78:
-                    cells.append(Text(proximity_label(d["rssi"]), style=dim))
-                if w >= 96:
-                    cells.append(sparkline([h + 100 for h in d["hist"]], 12, 70, C_DIM if stale else C_ACCENT))
-                if w >= 110:
-                    addr = d["addr"]
-                    cells.append(Text(addr if len(addr) <= 17 else addr[:8] + "…", style=C_DIM))
-                cells.append(Text("now" if age < 2 else fmt_age(age), style=C_DIM))
-                tbl.add_row(*cells)
-
-            note = Text(no_wrap=True, overflow="ellipsis", style=C_DIM)
-            note.append("BLE advertisements only. Distance is a rough hint from signal strength; walls and bodies change it.")
-            if len(nearby) > rows_avail:
-                tail = Text(f"↑↓ {top + 1}–{min(len(nearby), top + rows_avail)} of {len(nearby)}", style=C_DIM)
-                note = two_col(note, tail, w, keep="right")
-            parts: List = [two_col(status, right, w, keep="left")]
-            if nearby:
-                parts.append(tbl)
-            elif ble.scanning:
-                parts.append(Text(f"No device stronger than {BLE_MIN_RSSI} dBm yet.", style=C_DIM))
-            parts.append(note)
-            return Group(*parts)
-
-        return self.panel(Dynamic(body), "Nearby Bluetooth devices", f"stronger than {BLE_MIN_RSSI} dBm")
-
 
 # --------------------------------------------------------------------------- #
 # Startup
@@ -2361,7 +1900,6 @@ def main() -> int:
     stop = threading.Event()
     speed = SpeedTest(state.speed, SPEED_URL, SPEED_DURATION, SPEED_STREAMS, SPEED_MAX_MB)
     lan_scanner = LanScanner(state)
-    ble_scanner = BleScanner(state, stop)
 
     def refresh_ifaces() -> None:
         default_if, gateway = default_route()
@@ -2372,14 +1910,9 @@ def main() -> int:
         state.ifaces, state.main_iface = ifaces, main_if
         state.gateway = gateway
 
-    def refresh_bt() -> None:
-        state.bt = collect_bluetooth()
-
     workers: List[threading.Thread] = [TargetMonitor(state, t, LATENCY_INTERVAL, stop) for t in state.targets]
     workers.append(TrafficMonitor(state, stop))
     workers.append(Periodic("interfaces", refresh_ifaces, 4.0, state, stop))
-    workers.append(Periodic("bluetooth", refresh_bt, 15.0, state, stop))
-    workers.append(ble_scanner)
     for w in workers:
         w.start()
 
@@ -2394,15 +1927,13 @@ def main() -> int:
             running = True
             while running:
                 t0 = time.monotonic()
-                if ui.page != "ble" and ble_scanner.active.is_set():
-                    ble_scanner.stop_scan()   # leaving the Bluetooth page ends its scan
                 live.update(ui.render(console), refresh=True)
                 wait = max(0.0, frame - (time.monotonic() - t0))
                 if select.select([fd], [], [], wait)[0]:
                     for key in parse_keys(os.read(fd, 64).decode(errors="ignore")):
                         if key in ("q", "\x03", "\x04"):
                             running = False
-                        elif key in ("1", "2", "3"):
+                        elif key in ("1", "2"):
                             ui.set_page(PAGES[int(key) - 1][0])
                         elif key == "tab":
                             ui.next_page()
@@ -2412,8 +1943,6 @@ def main() -> int:
                             speed.start()
                         elif key == "n" and ui.page == "lan":
                             lan_scanner.start()
-                        elif key == "b" and ui.page == "ble":
-                            ble_scanner.toggle()
                         elif key == "a" and ui.page == "dash":
                             state.show_all = not state.show_all
                         elif key in ("up", "k"):
@@ -2433,7 +1962,6 @@ def main() -> int:
     finally:
         stop.set()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-        ble_scanner.join(timeout=2.0)
 
     sp = state.speed
     if sp.phase == "done":
